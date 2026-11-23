@@ -101,8 +101,9 @@ and wait for explicit approval:
 
 - **ASCII only.** All code, comments, messages, docs, and commit messages are
   printable ASCII. Use `--` not an em dash, `->` not an arrow, `"` not curly
-  quotes, "and" not an ampersand. Enforced by the ASCII gate below, which
-  exempts only the verbatim licence texts under `LICENSES/`.
+  quotes, "and" not an ampersand. Enforced by `tests/test_ascii.py`, which
+  checks every file git tracks or would track and exempts only the verbatim
+  licence texts under `LICENSES/`.
 - **US English** in code and documentation.
 - PEP 8, four-space indentation, lines up to 110 characters.
 - **Every source file starts with an SPDX header** (D2):
@@ -149,12 +150,11 @@ the dev container (D6):
 
 ```sh
 python3 -m unittest discover -s tests -v
-LC_ALL=C grep -rnP --exclude-dir=.git --exclude-dir=LICENSES '[^\t\r\n\x20-\x7e]' . ; test $? -eq 1
 ```
 
-Both commands must succeed. A green gate is the only acceptable pre-commit
-state. The dev container carries the tool set D6 defines; report a tool you
-need and do not find to the operator, never install or fetch one.
+It must succeed. A green gate is the only acceptable pre-commit state. The
+dev container carries the tool set D6 defines; report a tool you need and do
+not find to the operator, never install or fetch one.
 
 ## Measurements
 
