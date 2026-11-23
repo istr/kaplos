@@ -79,3 +79,10 @@ Ratified 2026-11-23.
   tag, both only for the baseline comparisons.
 - Digests and hashes are delegated measurements: the Containerfile is authored
   only after the executor has reported them.
+
+## D7 -- Results tables
+
+Ratified 2026-11-23.
+
+- The results tables live in `docs/RESULTS.md`, a Markdown file under
+  `docs/`. D5 stays unchanged.
