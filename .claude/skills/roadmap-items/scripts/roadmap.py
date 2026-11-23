@@ -1,0 +1,1315 @@
+#!/usr/bin/env python3
+"""roadmap.py -- item-based roadmap/backlog store as markdown-in-git.
+
+Stdlib only. No PyYAML, no third-party deps: the frontmatter is a tiny fixed
+shape and a hand-written parser keeps the supply chain empty, which is the whole
+point of a "code is liability" project. No subprocess either -- this script only
+reads and writes files in the working tree it is run from, and the one git-shaped
+operation it offers (emit-patch) is *generated* as text, not shelled out: the
+mbox is built directly with difflib/hashlib so the "no subprocess, auditable and
+bounded" invariant holds. The actual apply stays with the operator (git am), so
+apply == ratify is preserved. Commit/bundle remain the caller's job.
+
+Data model (see references/schema.md for the full spec):
+
+  roadmap/                 visible, one file per item, e.g. item-0042.md
+  roadmap/_order.md        the cross-arc global execution order (IDs, line order)
+  roadmap/completed/       done items are moved here
+
+  Item frontmatter (canonical field order):
+    id, status, arcs, rank, title, goal, acceptance_intent, links,
+    execution_profile
+
+  status:  proposed -> ratified -> done
+  rank:    numeric-sparse, zero-padded string ("0010", "0020", ...)
+  arcs:    list; an item may belong to several arcs (query tags)
+  _order:  global item ordering -- arcs are tags, this file decides what runs next
+"""
+
+import argparse
+import difflib
+import email.utils
+import hashlib
+import heapq
+import os
+import re
+import sys
+
+REQUIRED_FIELDS = ["id", "status", "arcs", "rank", "title", "goal",
+                   "acceptance_intent"]
+OPTIONAL_FIELDS = ["depends_on", "links", "execution_profile"]
+FIELD_ORDER = REQUIRED_FIELDS + OPTIONAL_FIELDS
+QUOTED_SCALARS = {"rank", "title", "goal", "acceptance_intent"}
+STATUSES = ["proposed", "ratified", "done"]
+LEGAL_FORWARD = {("proposed", "ratified"), ("ratified", "done")}
+ID_RE = re.compile(r"^item-(\d+)$")
+ORDER_LINE_RE = re.compile(r"^-\s+(item-\d+)\s*$")
+RANK_STEP = 10
+RANK_WIDTH = 4
+# Two arcs carry scheduling meaning beyond a query tag (see "Item classes" in
+# references/schema.md): every open item is beta, post-beta or parked.
+BETA_ARC = "beta-readiness"
+PARKED_ARC = "parked"
+
+
+# --------------------------------------------------------------------------
+# frontmatter parse / serialize
+# --------------------------------------------------------------------------
+
+def _unquote(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        return s[1:-1]
+    return s
+
+
+def _split_commas(inner):
+    # Inline lists/maps here never nest and their values never contain commas,
+    # so a plain split is correct and keeps the parser trivial.
+    return [p for p in (x.strip() for x in inner.split(",")) if p != ""]
+
+
+def _list_flag(values):
+    """Flatten a repeatable, comma-separated option into one ordered list.
+
+    Every list-valued option is declared with action="append", so argparse
+    hands back one entry per occurrence and each entry may itself be a comma
+    separated list. Both spellings work and may be mixed:
+
+        --add-link a,b
+        --add-link a --add-link b
+
+    Storing a single value instead would make a repeated option keep only the
+    last occurrence and drop the earlier ones with no error, which is a silent
+    edit loss rather than a usage mistake the caller can see.
+
+    Duplicates are collapsed, first occurrence winning, because every caller
+    treats these as sets and would otherwise have to re-check membership.
+    """
+    out = []
+    for v in values or []:
+        for part in _split_commas(v):
+            if part not in out:
+                out.append(part)
+    return out
+
+
+def _parse_value(val):
+    val = val.strip()
+    if val.startswith("[") and val.endswith("]"):
+        return [_unquote(x) for x in _split_commas(val[1:-1])]
+    if val.startswith("{") and val.endswith("}"):
+        d = {}
+        for pair in _split_commas(val[1:-1]):
+            k, _, v = pair.partition(":")
+            d[k.strip()] = _unquote(v.strip())
+        return d
+    return _unquote(val)
+
+
+def parse_item(text):
+    """Return (meta dict, body str). Raise ValueError on malformed frontmatter."""
+    if not text.startswith("---"):
+        raise ValueError("item has no frontmatter (must start with ---)")
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        raise ValueError("item frontmatter is not closed by a second ---")
+    fm, body = parts[1], parts[2].lstrip("\n")
+    meta = {}
+    for raw in fm.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        meta[key.strip()] = _parse_value(val)
+    return meta, body
+
+
+def _format_value(key, v):
+    if isinstance(v, list):
+        return "[" + ", ".join(v) + "]"
+    if isinstance(v, dict):
+        return "{ " + ", ".join("%s: %s" % (k, vv) for k, vv in v.items()) + " }"
+    s = str(v)
+    return '"%s"' % s if key in QUOTED_SCALARS else s
+
+
+def dump_item(meta, body):
+    """Serialize in canonical field order so diffs are stable and reviewable."""
+    lines = ["---"]
+    for k in FIELD_ORDER:
+        if k not in meta:
+            continue
+        v = meta[k]
+        if k in OPTIONAL_FIELDS and v in (None, "", [], {}):
+            continue
+        lines.append("%s: %s" % (k, _format_value(k, v)))
+    # Preserve any unexpected keys rather than silently dropping operator data.
+    for k in meta:
+        if k not in FIELD_ORDER:
+            lines.append("%s: %s" % (k, _format_value(k, meta[k])))
+    lines.append("---")
+    return "\n".join(lines) + "\n\n" + body.rstrip("\n") + "\n"
+
+
+def validate_meta(meta):
+    missing = [f for f in REQUIRED_FIELDS if f not in meta or meta[f] in (None, "", [])]
+    if missing:
+        raise ValueError("item is missing required field(s): " + ", ".join(missing))
+    if meta["status"] not in STATUSES:
+        raise ValueError("status must be one of %s" % STATUSES)
+    if not isinstance(meta["arcs"], list) or not meta["arcs"]:
+        raise ValueError("arcs must be a non-empty list")
+    if not ID_RE.match(meta["id"]):
+        raise ValueError("id must look like item-NNNN")
+    deps = meta.get("depends_on", [])
+    if deps:
+        if not isinstance(deps, list):
+            raise ValueError("depends_on must be a list of item ids")
+        for d in deps:
+            if not ID_RE.match(d):
+                raise ValueError("depends_on entry %r must look like item-NNNN" % d)
+            if d == meta["id"]:
+                raise ValueError("an item cannot depend on itself")
+        if len(set(deps)) != len(deps):
+            raise ValueError("depends_on has duplicate entries")
+
+
+def _is_ascii(text):
+    """Return True if text contains only ASCII characters."""
+    try:
+        text.encode('ascii')
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def validate_ascii(meta, body):
+    """Ensure meta and body contain only ASCII characters."""
+    for field in ["title", "goal", "acceptance_intent"]:
+        if field in meta and not _is_ascii(str(meta[field])):
+            raise ValueError("%s contains non-ASCII characters" % field)
+    if not _is_ascii(body):
+        raise ValueError("item body contains non-ASCII characters")
+
+
+# --------------------------------------------------------------------------
+# store helpers
+# --------------------------------------------------------------------------
+
+def completed_dir(root):
+    return os.path.join(root, "completed")
+
+
+def order_path(root):
+    return os.path.join(root, "_order.md")
+
+
+def item_path(root, item_id, completed=False):
+    base = completed_dir(root) if completed else root
+    return os.path.join(base, item_id + ".md")
+
+
+def _iter_item_files(root):
+    for base in (root, completed_dir(root)):
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)):
+            if ID_RE.match(name[:-3] if name.endswith(".md") else name):
+                yield os.path.join(base, name)
+
+
+def load_all(root):
+    """Return {id: (meta, body, path)} across active and completed items."""
+    out = {}
+    for path in _iter_item_files(root):
+        with open(path, encoding="utf-8") as fh:
+            meta, body = parse_item(fh.read())
+        out[meta["id"]] = (meta, body, path)
+    return out
+
+
+def write_item(meta, body, path):
+    validate_meta(meta)
+    validate_ascii(meta, body)
+    if ".." in path:
+        raise ValueError("Invalid file path")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(dump_item(meta, body))
+
+
+def next_id(root):
+    nums = [int(ID_RE.match(mid).group(1)) for mid in load_all(root)]
+    return "item-%04d" % ((max(nums) + 1) if nums else 1)
+
+
+def pad_rank(n):
+    return str(int(n)).zfill(RANK_WIDTH)
+
+
+def read_order(root):
+    p = order_path(root)
+    if not os.path.exists(p):
+        return []
+    ids = []
+    with open(p, encoding="utf-8") as fh:
+        for line in fh:
+            m = ORDER_LINE_RE.match(line.strip())
+            if m:
+                ids.append(m.group(1))
+    return ids
+
+
+ORDER_HEADER = (
+    "# Execution order (global, cross-arc)\n\n"
+    "Items run top to bottom; order is line order. Each line is `- <item-id>`.\n"
+    "Items not listed here are unscheduled. `rank` orders items *within* an arc\n"
+    "for queries; this file is the cross-arc truth for *what runs next*. IDs only\n"
+    "-- titles live in the item files (single source).\n\n"
+)
+
+
+def write_order(root, ids):
+    os.makedirs(root, exist_ok=True)
+    body = ORDER_HEADER + "".join("- %s\n" % i for i in ids)
+    with open(order_path(root), "w", encoding="utf-8") as fh:
+        fh.write(body)
+
+
+# --------------------------------------------------------------------------
+# dependency graph
+# --------------------------------------------------------------------------
+#
+# Edges are stored one-way, in `depends_on` on the dependent item: "these must
+# be done before I can start". There is deliberately no `blocks:` field -- a
+# two-sided edge list in a hand-editable markdown store is a sync bug waiting to
+# happen, so dependents are always derived here. `links` stays the non-blocking
+# pointer field; only `depends_on` carries the constraint a query may trust.
+
+def deps_of(meta):
+    return list(meta.get("depends_on", []))
+
+
+def deps_map(items):
+    return dict((mid, deps_of(m)) for mid, (m, _, _) in items.items())
+
+
+def reverse_deps(items):
+    """Derived index: {id: [ids that depend on it]}, in stable id order."""
+    rev = dict((mid, []) for mid in items)
+    for mid in sorted(items):
+        for d in deps_of(items[mid][0]):
+            rev.setdefault(d, []).append(mid)
+    return rev
+
+
+def is_satisfied(items, dep_id):
+    """A blocker counts as satisfied only once it is actually done."""
+    return dep_id in items and items[dep_id][0]["status"] == "done"
+
+
+def pending_deps(items, mid):
+    return [d for d in deps_of(items[mid][0]) if not is_satisfied(items, d)]
+
+
+def find_cycles(dmap):
+    """Return a list of cycles, each as the id list in traversal order."""
+    WHITE, GREY, BLACK = 0, 1, 2
+    color = dict((mid, WHITE) for mid in dmap)
+    cycles = []
+    seen = set()
+    for start in sorted(dmap):
+        if color[start] != WHITE:
+            continue
+        # Iterative DFS: the store can hold a long chain and a recursive walk
+        # would be one more thing to reason about at review time.
+        color[start] = GREY
+        path = [start]
+        stack = [(start, iter(dmap.get(start, [])))]
+        while stack:
+            node, it = stack[-1]
+            nxt = next(it, None)
+            if nxt is None:
+                color[node] = BLACK
+                path.pop()
+                stack.pop()
+                continue
+            if nxt not in dmap:              # dangling; reported separately
+                continue
+            if color[nxt] == GREY:
+                cyc = path[path.index(nxt):] + [nxt]
+                key = tuple(sorted(set(cyc)))
+                if key not in seen:
+                    seen.add(key)
+                    cycles.append(cyc)
+            elif color[nxt] == WHITE:
+                color[nxt] = GREY
+                path.append(nxt)
+                stack.append((nxt, iter(dmap.get(nxt, []))))
+    return cycles
+
+
+def would_cycle(dmap, mid, new_deps):
+    """True if giving `mid` these deps closes a loop back onto itself."""
+    probe = dict(dmap)
+    probe[mid] = list(new_deps)
+    for cyc in find_cycles(probe):
+        if mid in cyc:
+            return True
+    return False
+
+
+def transitive_deps(dmap, mid):
+    """Blockers of blockers, depth-first, cycle-safe."""
+    seen, out = set(), []
+    stack = list(reversed(dmap.get(mid, [])))
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        out.append(node)
+        stack.extend(reversed(dmap.get(node, [])))
+    return out
+
+
+def topo_order(ids, dmap):
+    """Stable dependency-legal re-sort of `ids`.
+
+    Kahn's algorithm keyed on the item's CURRENT position, so an already-legal
+    sequence comes back byte-identical and only the items that must move do.
+    A from-scratch topological sort would shuffle unrelated items and throw away
+    the human ordering judgement that is not expressible as an edge.
+
+    Returns (ordered_ids, stuck_ids); stuck_ids is non-empty only when a cycle
+    among scheduled items makes a full ordering impossible.
+    """
+    pos = dict((mid, i) for i, mid in enumerate(ids))
+    indeg, dependents = {}, dict((mid, []) for mid in ids)
+    for mid in ids:
+        blockers = [b for b in dmap.get(mid, []) if b in pos]
+        indeg[mid] = len(blockers)
+        for b in blockers:
+            dependents[b].append(mid)
+    heap = [(pos[m], m) for m in ids if indeg[m] == 0]
+    heapq.heapify(heap)
+    out = []
+    while heap:
+        _, mid = heapq.heappop(heap)
+        out.append(mid)
+        for dep in dependents[mid]:
+            indeg[dep] -= 1
+            if indeg[dep] == 0:
+                heapq.heappush(heap, (pos[dep], dep))
+    stuck = [m for m in ids if m not in set(out)]
+    return out + stuck, stuck
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def _arc_ranks(items, arc):
+    rows = [(m["rank"], mid) for mid, (m, _, _) in items.items() if arc in m["arcs"]]
+    return sorted(rows)
+
+
+def cmd_new(args):
+    root = args.root
+    arcs = _list_flag(args.arcs)
+    if not arcs:
+        sys.exit("error: --arcs needs at least one arc")
+    items = load_all(root)
+    if args.rank:
+        rank = pad_rank(args.rank)
+    else:
+        existing = _arc_ranks(items, arcs[0])
+        top = int(existing[-1][0]) if existing else 0
+        rank = pad_rank(top + RANK_STEP)
+    meta = {
+        "id": next_id(root),
+        "status": "proposed",
+        "arcs": arcs,
+        "rank": rank,
+        "title": args.title,
+        "goal": args.goal,
+        "acceptance_intent": args.acceptance,
+    }
+    if args.deps:
+        wanted = _list_flag(args.deps)
+        for d in wanted:
+            if d not in items:
+                sys.exit("error: dependency %s does not exist" % d)
+        meta["depends_on"] = wanted
+    if args.links:
+        meta["links"] = _list_flag(args.links)
+    if args.cls or args.reasoning:
+        meta["execution_profile"] = {
+            "class": args.cls or "smallest",
+            "reasoning": args.reasoning or "none",
+        }
+    body = (args.note or "Drift-invariant planning notes go here.").strip()
+    write_item(meta, body, item_path(root, meta["id"]))
+    print("created %s (status: proposed, rank: %s, arcs: %s)"
+          % (meta["id"], rank, ", ".join(arcs)))
+    print("note: 'new' does not schedule the item. Use 'reorder' to place it in "
+          "the execution order once it is ratified.")
+
+
+def cmd_list(args):
+    items = load_all(args.root)
+    rows = []
+    for mid, (m, _, _) in items.items():
+        # Default to the active set. Done items live in completed/ precisely to
+        # keep the working list small, so they are hidden unless asked for --
+        # either explicitly via --status done or broadly via --all.
+        if args.status:
+            if m["status"] != args.status:
+                continue
+        elif not args.all and m["status"] == "done":
+            continue
+        if args.arc and args.arc not in m["arcs"]:
+            continue
+        rows.append(m)
+    key = (lambda m: m["rank"]) if args.sort == "rank" else (lambda m: m["id"])
+    for m in sorted(rows, key=key):
+        print("%s  [%-8s] rank=%s  arcs=%s  %s"
+              % (m["id"], m["status"], m["rank"], ",".join(m["arcs"]), m["title"]))
+    if not rows:
+        print("(no matching items)")
+
+
+def cmd_arcs(args):
+    # An arc is open while it still holds a non-done item. Arcs are tags, not
+    # files, so the arc set is derived from item membership rather than stored;
+    # that keeps the store single-source and makes a retired arc disappear on
+    # its own once its last item moves to completed/.
+    items = load_all(args.root)
+    counts = {}
+    for _, (m, _, _) in items.items():
+        for arc in m["arcs"]:
+            tally = counts.setdefault(arc, dict((s, 0) for s in STATUSES))
+            tally[m["status"]] += 1
+    rows = []
+    for arc in sorted(counts):
+        tally = counts[arc]
+        open_n = sum(tally[s] for s in STATUSES if s != "done")
+        if open_n == 0 and not args.all:
+            continue
+        rows.append((arc, tally, open_n))
+    if args.sort == "open":
+        rows.sort(key=lambda r: (-r[2], r[0]))
+    for arc, tally, open_n in rows:
+        print("%-28s open=%-3d (proposed=%d ratified=%d)  done=%d"
+              % (arc, open_n, tally["proposed"], tally["ratified"], tally["done"]))
+    if not rows:
+        print("(no open arcs)" if not args.all else "(no arcs)")
+
+
+def _label(items, mid):
+    if mid not in items:
+        return "%s  [MISSING]" % mid
+    m = items[mid][0]
+    return "%s  [%-8s] %s" % (mid, m["status"], m["title"])
+
+
+def _deps_show(items, args):
+    if args.id not in items:
+        sys.exit("error: %s not found" % args.id)
+    dmap = deps_map(items)
+    rev = reverse_deps(items)
+    m = items[args.id][0]
+    print(_label(items, args.id))
+    blockers = transitive_deps(dmap, args.id) if args.transitive \
+        else deps_of(m)
+    if blockers:
+        print("  depends on%s:" % (" (transitive)" if args.transitive else ""))
+        for d in blockers:
+            mark = "SATISFIED" if is_satisfied(items, d) else "PENDING  "
+            print("    %s  %s" % (mark, _label(items, d)))
+    else:
+        print("  depends on: (nothing)")
+    if rev.get(args.id):
+        print("  blocks:")
+        for d in rev[args.id]:
+            print("    %s" % _label(items, d))
+    else:
+        print("  blocks: (nothing)")
+    pend = [d for d in transitive_deps(dmap, args.id)
+            if not is_satisfied(items, d)]
+    if m["status"] == "done":
+        print("  state: DONE")
+    elif pend:
+        print("  state: BLOCKED (%d pending blocker(s), transitively)" % len(pend))
+    else:
+        print("  state: READY (no pending blockers)")
+
+
+def _deps_ready(items, order_ids):
+    dmap = deps_map(items)
+    rows = []
+    for mid in sorted(items):
+        m = items[mid][0]
+        if m["status"] != "ratified":
+            continue
+        if any(not is_satisfied(items, d) for d in transitive_deps(dmap, mid)):
+            continue
+        pos = order_ids.index(mid) + 1 if mid in order_ids else None
+        rows.append((pos if pos is not None else 10 ** 6, pos, mid))
+    for _, pos, mid in sorted(rows):
+        where = "#%-3d" % pos if pos else "----"
+        print("%s %s" % (where, _label(items, mid)))
+    if not rows:
+        print("(nothing ratified is unblocked)")
+
+
+def _deps_blocked(items):
+    dmap = deps_map(items)
+    any_row = False
+    for mid in sorted(items):
+        m = items[mid][0]
+        if m["status"] == "done":
+            continue
+        pend = [d for d in transitive_deps(dmap, mid) if not is_satisfied(items, d)]
+        if not pend:
+            continue
+        any_row = True
+        print(_label(items, mid))
+        for d in pend:
+            direct = "direct  " if d in deps_of(m) else "indirect"
+            print("    waits on %s  %s" % (direct, _label(items, d)))
+    if not any_row:
+        print("(nothing is blocked)")
+
+
+def _deps_check(items, order_ids):
+    """Report every way the edge set and the execution order disagree."""
+    dmap = deps_map(items)
+    pos = dict((mid, i) for i, mid in enumerate(order_ids))
+    problems = []
+    for mid in sorted(items):
+        m = items[mid][0]
+        for d in deps_of(m):
+            if d not in items:
+                problems.append(("dangling", "%s depends on %s, which does not "
+                                             "exist" % (mid, d)))
+                continue
+            dm = items[d][0]
+            if m["status"] == "ratified" and dm["status"] == "proposed":
+                problems.append(("status-inversion",
+                                 "%s is ratified but blocker %s is still proposed"
+                                 % (mid, d)))
+            if m["status"] == "done" and dm["status"] != "done":
+                problems.append(("status-inversion",
+                                 "%s is done but blocker %s is %s"
+                                 % (mid, d, dm["status"])))
+            if mid in pos:
+                if d in pos:
+                    if pos[d] > pos[mid]:
+                        problems.append(("order",
+                                         "%s is scheduled at #%d, before its blocker "
+                                         "%s at #%d" % (mid, pos[mid] + 1, d,
+                                                        pos[d] + 1)))
+                elif dm["status"] != "done":
+                    problems.append(("order",
+                                     "%s is scheduled at #%d but blocker %s is "
+                                     "%s and unscheduled"
+                                     % (mid, pos[mid] + 1, d, dm["status"])))
+    for cyc in find_cycles(dmap):
+        problems.append(("cycle", " -> ".join(cyc)))
+    problems.extend(_class_problems(items, order_ids))
+    if not problems:
+        print("dependency check: clean (%d items, %d edges)"
+              % (len(items), sum(len(v) for v in dmap.values())))
+        return 0
+    last = None
+    for kind, msg in sorted(problems):
+        if kind != last:
+            print("%s:" % kind)
+            last = kind
+        print("  %s" % msg)
+    print("\n%d problem(s)." % len(problems))
+    return 1
+
+
+def _class_problems(items, order_ids):
+    """Report every open item that is not in exactly one class.
+
+    Classes: beta (BETA_ARC, a closed prefix of the order), post-beta
+    (scheduled, not BETA_ARC) and parked (PARKED_ARC, never scheduled).
+    """
+    def in_arc(mid, arc):
+        return arc in items[mid][0]["arcs"]
+
+    def is_open(mid):
+        return mid in items and items[mid][0]["status"] != "done"
+
+    problems = []
+    scheduled = set(order_ids)
+    for mid in sorted(items):
+        if not is_open(mid):
+            continue
+        m = items[mid][0]
+        beta, parked = in_arc(mid, BETA_ARC), in_arc(mid, PARKED_ARC)
+        if m["status"] == "ratified" and mid not in scheduled and not parked:
+            problems.append(("class", "%s is ratified but neither scheduled "
+                                      "nor %s" % (mid, PARKED_ARC)))
+        if parked and mid in scheduled:
+            problems.append(("class", "%s is %s but scheduled" % (mid, PARKED_ARC)))
+        if beta and parked:
+            problems.append(("class", "%s is both %s and %s"
+                                      % (mid, BETA_ARC, PARKED_ARC)))
+        if beta:
+            for d in deps_of(m):
+                if is_open(d) and not in_arc(d, BETA_ARC):
+                    problems.append(("class", "%s is %s but blocker %s is not"
+                                              % (mid, BETA_ARC, d)))
+    first_post = None
+    for i, mid in enumerate(order_ids):
+        if not is_open(mid):
+            continue
+        if not in_arc(mid, BETA_ARC):
+            if first_post is None:
+                first_post = (i, mid)
+        elif first_post is not None:
+            problems.append(("class", "%s (%s) is scheduled at #%d, after "
+                                      "post-beta %s at #%d"
+                                      % (mid, BETA_ARC, i + 1, first_post[1],
+                                         first_post[0] + 1)))
+            break
+    return problems
+
+
+def _deps_dot(items):
+    print("digraph roadmap {")
+    print('  rankdir=LR; node [shape=box, fontname="monospace"];')
+    for mid in sorted(items):
+        m = items[mid][0]
+        if m["status"] == "done":
+            continue
+        print('  "%s" [label="%s\\n%s"];'
+              % (mid, mid, m["title"].replace('"', "'")[:40]))
+    for mid in sorted(items):
+        if items[mid][0]["status"] == "done":
+            continue
+        for d in deps_of(items[mid][0]):
+            style = ' [style=dashed]' if is_satisfied(items, d) else ""
+            print('  "%s" -> "%s"%s;' % (d, mid, style))
+    print("}")
+
+
+def cmd_deps(args):
+    items = load_all(args.root)
+    order_ids = read_order(args.root)
+    if args.check:
+        sys.exit(_deps_check(items, order_ids))
+    if args.dot:
+        _deps_dot(items)
+    elif args.ready:
+        _deps_ready(items, order_ids)
+    elif args.blocked:
+        _deps_blocked(items)
+    elif args.id:
+        _deps_show(items, args)
+    else:
+        sys.exit("error: pass an item id, or one of --ready/--blocked/--check/--dot")
+
+
+def cmd_order(args):
+    items = load_all(args.root)
+    ids = read_order(args.root)
+    if not ids:
+        print("(execution order is empty)")
+        return
+    if args.topo:
+        _order_topo(items, ids)
+        return
+    for pos, mid in enumerate(ids, 1):
+        if mid in items:
+            m = items[mid][0]
+            print("%2d. %s  [%s]  %s" % (pos, mid, m["status"], m["title"]))
+        else:
+            print("%2d. %s  [MISSING item file]" % (pos, mid))
+
+
+def _order_topo(items, ids):
+    """Print a dependency-legal re-sort as a diff. Never writes.
+
+    The operator gate is the point: this proposes, the human applies (with
+    'reorder'), and the ratifying commit stays the single handover.
+    """
+    proposed, stuck = topo_order(ids, deps_map(items))
+    if stuck:
+        print("warning: cycle among scheduled items; these could not be ordered "
+              "and were left in place: %s" % ", ".join(stuck))
+    if proposed == ids:
+        if stuck:
+            print("nothing can be moved automatically: break the cycle first "
+                  "('update ID --remove-dep ...'), then re-run.")
+        else:
+            print("execution order is already dependency-legal (%d items); "
+                  "nothing to move." % len(ids))
+        return
+    diff = difflib.unified_diff(ids, proposed, fromfile="_order.md (current)",
+                                tofile="_order.md (topo)", lineterm="", n=2)
+    for line in diff:
+        print(line)
+    moved = [mid for mid in ids if ids.index(mid) != proposed.index(mid)]
+    print("\n%d item(s) would move. This is a proposal only -- nothing was "
+          "written." % len(moved))
+    first = moved[0]
+    at = proposed.index(first)
+    hint = ("reorder %s --to-position 1" % first) if at == 0 else \
+           ("reorder %s --after %s" % (first, proposed[at - 1]))
+    hint_more = "" if len(moved) == 1 else " (and %d more)" % (len(moved) - 1)
+    print("Apply it with 'reorder', e.g. %s%s." % (hint, hint_more))
+
+
+def cmd_next(args):
+    items = load_all(args.root)
+    for mid in read_order(args.root):
+        m = items.get(mid, (None,))[0]
+        if m and m["status"] == "ratified":
+            print("next to execute: %s" % mid)
+            print("  title:             %s" % m["title"])
+            print("  goal:              %s" % m["goal"])
+            print("  acceptance_intent: %s" % m["acceptance_intent"])
+            print("  arcs:              %s" % ", ".join(m["arcs"]))
+            if "links" in m:
+                print("  links:             %s" % ", ".join(m["links"]))
+            if "execution_profile" in m:
+                ep = m["execution_profile"]
+                print("  execution_profile: class=%s reasoning=%s (advisory)"
+                      % (ep.get("class", "?"), ep.get("reasoning", "?")))
+            pend = [d for d in transitive_deps(deps_map(items), mid)
+                    if not is_satisfied(items, d)]
+            if pend:
+                # Without this, 'next' can confidently hand out an item that
+                # cannot actually be started.
+                print("  BLOCKED BY:        %s" % ", ".join(pend))
+                print("\nThis item is not runnable yet. 'deps --ready' lists what "
+                      "is, and 'order --topo' proposes a legal order.")
+                return
+            print("  blockers:          none pending")
+            print("\nAuthor the byte-exact instruction ephemerally against the "
+                  "current pin -- do not store it back here.")
+            return
+    print("(nothing ratified at the top of the execution order)")
+
+
+def cmd_show(args):
+    items = load_all(args.root)
+    if args.id not in items:
+        sys.exit("error: %s not found" % args.id)
+    m, body, _ = items[args.id]
+    sys.stdout.write(dump_item(m, body))
+
+
+def _load_one(root, item_id):
+    items = load_all(root)
+    if item_id not in items:
+        sys.exit("error: %s not found" % item_id)
+    return items[item_id]
+
+
+def cmd_set_status(args):
+    m, body, path = _load_one(args.root, args.id)
+    old = m["status"]
+    new = args.status
+    if new == "done":
+        sys.exit("error: use 'done' to retire an item (it also writes the final "
+                 "summary and moves the file to completed/).")
+    if not args.force and (old, new) not in LEGAL_FORWARD:
+        sys.exit("error: %s -> %s is not a forward transition. The real gate for "
+                 "proposed -> ratified is the operator's ratifying commit/merge; "
+                 "this flag-flip rides along with it. Use --force only to correct "
+                 "a mistake." % (old, new))
+    m["status"] = new
+    write_item(m, body, path)
+    print("%s: %s -> %s" % (args.id, old, new))
+
+
+def cmd_update(args):
+    m, body, path = _load_one(args.root, args.id)
+    if args.title:
+        m["title"] = args.title
+    if args.goal:
+        m["goal"] = args.goal
+    if args.acceptance:
+        m["acceptance_intent"] = args.acceptance
+    if args.add_dep or args.remove_dep:
+        items = load_all(args.root)
+        deps = deps_of(m)
+        for d in _list_flag(args.add_dep):
+            if d == args.id:
+                sys.exit("error: an item cannot depend on itself")
+            if d not in items:
+                sys.exit("error: dependency %s does not exist" % d)
+            if d not in deps:
+                deps.append(d)
+        for d in _list_flag(args.remove_dep):
+            if d in deps:
+                deps.remove(d)
+        # A cycle is never a legitimate intermediate state, so it is refused at
+        # write time rather than merely reported later by 'deps --check'.
+        if would_cycle(deps_map(items), args.id, deps):
+            sys.exit("error: that dependency would create a cycle. Run "
+                     "'deps %s --transitive' to see the chain." % args.id)
+        if deps:
+            m["depends_on"] = deps
+        elif "depends_on" in m:
+            del m["depends_on"]
+    links = m.get("links", [])
+    for l in _list_flag(args.add_link):
+        if l not in links:
+            links.append(l)
+    for l in _list_flag(args.remove_link):
+        if l in links:
+            links.remove(l)
+    if links:
+        m["links"] = links
+    elif "links" in m:
+        del m["links"]
+    if args.cls or args.reasoning:
+        ep = m.get("execution_profile", {})
+        if args.cls:
+            ep["class"] = args.cls
+        if args.reasoning:
+            ep["reasoning"] = args.reasoning
+        m["execution_profile"] = ep
+    write_item(m, body, path)
+    print("updated %s" % args.id)
+
+
+def cmd_rank(args):
+    m, body, path = _load_one(args.root, args.id)
+    if args.to:
+        m["rank"] = pad_rank(args.to)
+    elif args.between:
+        a, b = args.between
+        items = load_all(args.root)
+        for nid in (a, b):
+            if nid not in items:
+                sys.exit("error: neighbour %s not found" % nid)
+        lo, hi = sorted((int(items[a][0]["rank"]), int(items[b][0]["rank"])))
+        mid = (lo + hi) // 2
+        if mid <= lo or mid >= hi:
+            sys.exit("error: no integer gap between rank %04d and %04d. Run "
+                     "'rescale <arc>' to re-space that arc, then retry." % (lo, hi))
+        m["rank"] = pad_rank(mid)
+    else:
+        sys.exit("error: pass --to RANK or --between ID_A ID_B")
+    write_item(m, body, path)
+    print("%s rank -> %s" % (args.id, m["rank"]))
+
+
+def cmd_rescale(args):
+    items = load_all(args.root)
+    ordered = _arc_ranks(items, args.arc)
+    if not ordered:
+        sys.exit("error: no items in arc %s" % args.arc)
+    for i, (_, mid) in enumerate(ordered, 1):
+        m, body, path = items[mid]
+        new = pad_rank(i * args.step)
+        if new != m["rank"]:
+            print("  %s: %s -> %s" % (mid, m["rank"], new))
+        m["rank"] = new
+        write_item(m, body, path)
+    print("rescaled arc %s in steps of %d" % (args.arc, args.step))
+
+
+def cmd_restructure(args):
+    m, body, path = _load_one(args.root, args.id)
+    arcs = list(m["arcs"])
+    if args.arcs:
+        arcs = _list_flag(args.arcs)
+    for a in _list_flag(args.add_arc):
+        if a not in arcs:
+            arcs.append(a)
+    for a in _list_flag(args.remove_arc):
+        if a in arcs:
+            arcs.remove(a)
+    if not arcs:
+        sys.exit("error: an item must belong to at least one arc")
+    m["arcs"] = arcs
+    write_item(m, body, path)
+    print("%s arcs -> %s" % (args.id, ", ".join(arcs)))
+
+
+def cmd_reorder(args):
+    items = load_all(args.root)
+    if args.id not in items:
+        sys.exit("error: %s not found" % args.id)
+    ids = read_order(args.root)
+    ids = [i for i in ids if i != args.id]
+    if args.remove:
+        write_order(args.root, ids)
+        print("removed %s from the execution order" % args.id)
+        return
+    if args.after_deps:
+        # Earliest legal slot: right after the last-scheduled blocker. Blockers
+        # that are already done impose no constraint.
+        blockers = [d for d in transitive_deps(deps_map(items), args.id)
+                    if d in ids and not is_satisfied(items, d)]
+        if not blockers:
+            print("note: %s has no scheduled pending blockers; appending." % args.id)
+            ids.append(args.id)
+        else:
+            anchor = max(blockers, key=lambda d: ids.index(d))
+            ids.insert(ids.index(anchor) + 1, args.id)
+            print("placed after last pending blocker %s" % anchor)
+        write_order(args.root, ids)
+        print("execution order updated; %s placed" % args.id)
+        return
+    if args.before:
+        if args.before not in ids:
+            sys.exit("error: anchor %s is not in the execution order" % args.before)
+        ids.insert(ids.index(args.before), args.id)
+    elif args.after:
+        if args.after not in ids:
+            sys.exit("error: anchor %s is not in the execution order" % args.after)
+        ids.insert(ids.index(args.after) + 1, args.id)
+    elif args.to_position is not None:
+        pos = max(1, min(args.to_position, len(ids) + 1))
+        ids.insert(pos - 1, args.id)
+    else:
+        ids.append(args.id)
+    write_order(args.root, ids)
+    print("execution order updated; %s placed" % args.id)
+
+
+def cmd_done(args):
+    m, body, path = _load_one(args.root, args.id)
+    if m["status"] != "ratified" and not args.force:
+        sys.exit("error: only a ratified item should move to done. Use --force to "
+                 "override for a correction.")
+    m["status"] = "done"
+    summary = "\n\n## Final summary\n\n%s\n" % args.summary.strip()
+    body = body.rstrip("\n") + summary
+    dest = item_path(args.root, args.id, completed=True)
+    write_item(m, body, dest)
+    if os.path.abspath(dest) != os.path.abspath(path):
+        os.remove(path)
+    ids = [i for i in read_order(args.root) if i != args.id]
+    write_order(args.root, ids)
+    print("%s -> done, moved to completed/, dropped from execution order" % args.id)
+    print("commit this with the item id in the message (executor convention).")
+
+
+# --------------------------------------------------------------------------
+# patch emission (git am-consumable mbox, generated as text -- no subprocess)
+# --------------------------------------------------------------------------
+#
+# The output is a one-message mbox in git's own patch shape. The operator applies
+# it with `git am`, and *that* apply is the ratifying commit -- so the From:/
+# Subject: envelope is load-bearing, not cosmetic. New files are pure additive
+# hunks; modified/deleted files use difflib for correct context. Blob SHAs are
+# the real git object ids (sha1("blob <len>\0<bytes>")) so `git am -3` can
+# 3-way-recover against a drifted tree; with a clean apply they are ignored.
+
+NULL_SHA = "0" * 40
+MBOX_POSTMARK = "From %s Mon Sep 17 00:00:00 2001\n" % NULL_SHA
+DEFAULT_AUTHOR = "roadmap-bot <roadmap-bot@localhost>"
+
+
+def blob_sha(data):
+    """git blob object id for the given bytes (stdlib, no git needed)."""
+    h = hashlib.sha1()
+    h.update(b"blob " + str(len(data)).encode("ascii") + b"\0" + data)
+    return h.hexdigest()
+
+
+def _read_bytes(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _store_prefix(root):
+    # Patch paths must be repo-relative. The store dir is conventionally
+    # 'roadmap/'; basename works whether --root is relative or absolute.
+    return os.path.basename(os.path.normpath(root))
+
+
+def _walk_store(storedir):
+    """{path-relative-to-store: full-path} for every .md under the store."""
+    out = {}
+    for dirpath, _dirs, files in os.walk(storedir):
+        for name in files:
+            if name.endswith(".md"):
+                full = os.path.join(dirpath, name)
+                out[os.path.relpath(full, storedir)] = full
+    return out
+
+
+def _new_file_hunk(rel, new_bytes):
+    lines = new_bytes.decode("utf-8").splitlines(keepends=True)
+    out = [
+        "diff --git a/%s b/%s\n" % (rel, rel),
+        "new file mode 100644\n",
+        "index %s..%s\n" % (NULL_SHA, blob_sha(new_bytes)),
+        "--- /dev/null\n",
+        "+++ b/%s\n" % rel,
+        "@@ -0,0 +1,%d @@\n" % len(lines),
+    ]
+    out += ["+" + ln for ln in lines]
+    return out
+
+
+def _delete_file_hunk(rel, old_bytes):
+    lines = old_bytes.decode("utf-8").splitlines(keepends=True)
+    out = [
+        "diff --git a/%s b/%s\n" % (rel, rel),
+        "deleted file mode 100644\n",
+        "index %s..%s\n" % (blob_sha(old_bytes), NULL_SHA),
+        "--- a/%s\n" % rel,
+        "+++ /dev/null\n",
+        "@@ -1,%d +0,0 @@\n" % len(lines),
+    ]
+    out += ["-" + ln for ln in lines]
+    return out
+
+
+def _modify_hunk(rel, old_bytes, new_bytes):
+    old_lines = old_bytes.decode("utf-8").splitlines(keepends=True)
+    new_lines = new_bytes.decode("utf-8").splitlines(keepends=True)
+    body = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile="a/" + rel, tofile="b/" + rel, lineterm="\n"))
+    if not body:
+        return []
+    return [
+        "diff --git a/%s b/%s\n" % (rel, rel),
+        "index %s..%s 100644\n" % (blob_sha(old_bytes), blob_sha(new_bytes)),
+    ] + body
+
+
+def _file_hunk(rel, old_bytes, new_bytes):
+    if old_bytes is None and new_bytes is not None:
+        return _new_file_hunk(rel, new_bytes)
+    if old_bytes is not None and new_bytes is None:
+        return _delete_file_hunk(rel, old_bytes)
+    if old_bytes is not None and new_bytes is not None and old_bytes != new_bytes:
+        return _modify_hunk(rel, old_bytes, new_bytes)
+    return []
+
+
+def build_mbox(message, author, date_str, diff_lines):
+    """Assemble the one-message mbox. First message line is the subject."""
+    msg_lines = (message or "roadmap: update").splitlines() or ["roadmap: update"]
+    subject, body = msg_lines[0], msg_lines[1:]
+    parts = [
+        MBOX_POSTMARK,
+        "From: %s\n" % author,
+        "Date: %s\n" % date_str,
+        "Subject: [PATCH] %s\n" % subject,
+        "\n",
+    ]
+    if body:
+        parts += [b + "\n" for b in body]
+        parts.append("\n")
+    parts.append("---\n\n")
+    parts += diff_lines
+    return "".join(parts)
+
+
+def cmd_emit_patch(args):
+    root = args.root
+    prefix = _store_prefix(root)
+    diff_lines = []
+
+    if args.baseline:
+        # General mode: diff a pristine store dir against the current one. Catches
+        # modifies (_order.md, in-place edits) and the delete+create of a done-move.
+        cur = _walk_store(root)
+        base = _walk_store(args.baseline)
+        for rel in sorted(set(cur) | set(base)):
+            old = _read_bytes(base[rel]) if rel in base else None
+            new = _read_bytes(cur[rel]) if rel in cur else None
+            diff_lines += _file_hunk(os.path.join(prefix, rel), old, new)
+        default_msg = "roadmap: update"
+    else:
+        # Creation mode (the 'new task' path): given item IDs, emit pure additive
+        # new-file hunks. No baseline, no git -- the file content is the patch.
+        if not args.ids:
+            sys.exit("error: pass item IDs (creation mode) or --baseline DIR "
+                     "(general mode, for edits/_order/done-moves)")
+        for iid in args.ids:
+            if not ID_RE.match(iid):
+                sys.exit("error: %s is not an item id (expected item-NNNN)" % iid)
+            active, done = item_path(root, iid), item_path(root, iid, completed=True)
+            full = active if os.path.exists(active) else (
+                done if os.path.exists(done) else None)
+            if full is None:
+                sys.exit("error: %s not found on disk -- create it first" % iid)
+            rel = os.path.relpath(full, root)
+            diff_lines += _new_file_hunk(os.path.join(prefix, rel),
+                                         _read_bytes(full))
+        default_msg = "roadmap: add " + ", ".join(args.ids)
+
+    if not diff_lines:
+        sys.exit("error: nothing to emit (no changes detected)")
+
+    mbox = build_mbox(args.message or default_msg,
+                      args.author or DEFAULT_AUTHOR,
+                      email.utils.formatdate(localtime=True),
+                      diff_lines)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(mbox)
+        print("wrote %s" % args.output)
+        print("operator applies (this apply ratifies): git am %s" % args.output)
+    else:
+        sys.stdout.write(mbox)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(description="item-based roadmap store (markdown-in-git)")
+    p.add_argument("--root", default="roadmap", help="store directory (default: roadmap)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    n = sub.add_parser("new", help="create a proposed item")
+    n.add_argument("--title", required=True)
+    n.add_argument("--arcs", required=True, action="append",
+                   help="arc names; comma-separated and/or repeated")
+    n.add_argument("--goal", required=True, help="one-line end state")
+    n.add_argument("--acceptance", required=True, help="acceptance intent (not greps)")
+    n.add_argument("--rank")
+    n.add_argument("--deps", action="append",
+                   help="item ids that must be done first; comma-separated and/or repeated")
+    n.add_argument("--links", action="append",
+                   help="pointers; comma-separated and/or repeated")
+    n.add_argument("--class", dest="cls", help="execution_profile class (advisory)")
+    n.add_argument("--reasoning", help="execution_profile reasoning depth (advisory)")
+    n.add_argument("--note", help="drift-invariant body note")
+    n.set_defaults(func=cmd_new)
+
+    l = sub.add_parser("list", help="query items by status/arc, sorted")
+    l.add_argument("--status", choices=STATUSES)
+    l.add_argument("--arc")
+    l.add_argument("--all", action="store_true",
+                   help="include done/archived items (default: active only)")
+    l.add_argument("--sort", choices=["rank", "id"], default="rank")
+    l.set_defaults(func=cmd_list)
+
+    ar = sub.add_parser("arcs", help="list arcs that still have open items")
+    ar.add_argument("--all", action="store_true",
+                    help="include arcs whose items are all done")
+    ar.add_argument("--sort", choices=["name", "open"], default="name")
+    ar.set_defaults(func=cmd_arcs)
+
+    dp = sub.add_parser("deps", help="query the dependency graph / validate it")
+    dp.add_argument("id", nargs="?", help="show one item's blockers and dependents")
+    dp.add_argument("--transitive", action="store_true",
+                    help="with ID: walk blockers of blockers")
+    dp.add_argument("--ready", action="store_true",
+                    help="ratified items whose blockers are all done")
+    dp.add_argument("--blocked", action="store_true",
+                    help="open items with at least one pending blocker")
+    dp.add_argument("--check", action="store_true",
+                    help="validate edges vs order; exits non-zero on problems")
+    dp.add_argument("--dot", action="store_true", help="graphviz emit (open subgraph)")
+    dp.set_defaults(func=cmd_deps)
+
+    o = sub.add_parser("order", help="show the global execution order")
+    o.add_argument("--topo", action="store_true",
+                   help="propose a dependency-legal re-sort as a diff (writes nothing)")
+    o.set_defaults(func=cmd_order)
+
+    nx = sub.add_parser("next", help="show the top ratified item to execute")
+    nx.set_defaults(func=cmd_next)
+
+    sh = sub.add_parser("show", help="print a single item verbatim")
+    sh.add_argument("id")
+    sh.set_defaults(func=cmd_show)
+
+    ss = sub.add_parser("set-status", help="advance status (proposed -> ratified)")
+    ss.add_argument("id")
+    ss.add_argument("status", choices=STATUSES)
+    ss.add_argument("--force", action="store_true")
+    ss.set_defaults(func=cmd_set_status)
+
+    up = sub.add_parser("update", help="edit item fields in place")
+    up.add_argument("id")
+    up.add_argument("--title")
+    up.add_argument("--goal")
+    up.add_argument("--acceptance")
+    up.add_argument("--add-link", dest="add_link", action="append",
+                    help="links to add; comma-separated and/or repeated")
+    up.add_argument("--remove-link", dest="remove_link", action="append")
+    up.add_argument("--add-dep", dest="add_dep", action="append",
+                    help="blockers to add, comma-separated and/or repeated "
+                         "(cycles refused)")
+    up.add_argument("--remove-dep", dest="remove_dep", action="append")
+    up.add_argument("--class", dest="cls")
+    up.add_argument("--reasoning")
+    up.set_defaults(func=cmd_update)
+
+    rk = sub.add_parser("rank", help="reprioritize within an arc")
+    rk.add_argument("id")
+    rk.add_argument("--to", help="explicit rank")
+    rk.add_argument("--between", nargs=2, metavar=("ID_A", "ID_B"))
+    rk.set_defaults(func=cmd_rank)
+
+    rs = sub.add_parser("rescale", help="re-space all ranks in one arc")
+    rs.add_argument("arc")
+    rs.add_argument("--step", type=int, default=RANK_STEP)
+    rs.set_defaults(func=cmd_rescale)
+
+    re_ = sub.add_parser("restructure", help="change an item's arc membership")
+    re_.add_argument("id")
+    re_.add_argument("--arcs", action="append",
+                     help="replace the whole arc list; comma-separated and/or repeated")
+    re_.add_argument("--add-arc", dest="add_arc", action="append")
+    re_.add_argument("--remove-arc", dest="remove_arc", action="append")
+    re_.set_defaults(func=cmd_restructure)
+
+    ro = sub.add_parser("reorder", help="move an item in the global execution order")
+    ro.add_argument("id")
+    ro.add_argument("--before")
+    ro.add_argument("--after")
+    ro.add_argument("--to-position", type=int, dest="to_position")
+    ro.add_argument("--after-deps", action="store_true", dest="after_deps",
+                    help="place at the earliest legal slot: just after the "
+                         "last-scheduled pending blocker")
+    ro.add_argument("--remove", action="store_true", help="unschedule (drop from order)")
+    ro.set_defaults(func=cmd_reorder)
+
+    dn = sub.add_parser("done", help="retire a ratified item with a final summary")
+    dn.add_argument("id")
+    dn.add_argument("--summary", required=True)
+    dn.add_argument("--force", action="store_true")
+    dn.set_defaults(func=cmd_done)
+
+    ep = sub.add_parser(
+        "emit-patch",
+        help="emit a git am-consumable mbox patch (stdlib, no git invoked)")
+    ep.add_argument("ids", nargs="*",
+                    help="item IDs to emit as new-file creations (the 'new task' path)")
+    ep.add_argument("--baseline",
+                    help="pristine store dir to diff against (general mode: "
+                         "edits, _order.md, done-moves)")
+    ep.add_argument("-m", "--message",
+                    help="commit message; first line becomes the subject")
+    ep.add_argument("-o", "--output", help="write patch to FILE (default: stdout)")
+    ep.add_argument("--author",
+                    help='author "Name <email>"; git am preserves it into the tree')
+    ep.set_defaults(func=cmd_emit_patch)
+
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        args.func(args)
+    except ValueError as exc:
+        sys.exit("error: %s" % exc)
+
+
+if __name__ == "__main__":
+    main()

@@ -101,12 +101,17 @@ and wait for explicit approval:
 
 - **ASCII only.** All code, comments, messages, docs, and commit messages are
   printable ASCII. Use `--` not an em dash, `->` not an arrow, `"` not curly
-  quotes, "and" not an ampersand. Enforced by the ASCII gate below.
+  quotes, "and" not an ampersand. Enforced by the ASCII gate below, which
+  exempts only the verbatim licence texts under `LICENSES/`.
 - **US English** in code and documentation.
 - PEP 8, four-space indentation, lines up to 110 characters.
 - **Every source file starts with an SPDX header** (D2):
   `# SPDX-License-Identifier: BSD-2-Clause-Patent` for code,
-  `<!-- SPDX-License-Identifier: CC-BY-4.0 -->` for documentation.
+  `<!-- SPDX-License-Identifier: CC-BY-4.0 -->` for documentation. Two
+  exceptions carry no header and fall under D2 by file type: files whose
+  format fixes the first line (YAML frontmatter of roadmap items and skill
+  files), and the vendored `roadmap-items` skill, which stays byte-identical
+  to its upstream.
 - **Comments are self-contained:** no roadmap ids, instruction references,
   historical narrative, or chat-only labels. The one durable cross-reference
   a comment may carry is a decision number from `docs/DECISIONS.md`.
@@ -144,7 +149,7 @@ the dev container (D6):
 
 ```sh
 python3 -m unittest discover -s tests -v
-LC_ALL=C grep -rnI --exclude-dir=.git '[^[:print:][:space:]]' . ; test $? -eq 1
+LC_ALL=C grep -rnP --exclude-dir=.git --exclude-dir=LICENSES '[^\t\r\n\x20-\x7e]' . ; test $? -eq 1
 ```
 
 Both commands must succeed. A green gate is the only acceptable pre-commit
