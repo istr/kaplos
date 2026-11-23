@@ -86,3 +86,19 @@ Ratified 2026-11-23.
 
 - The results tables live in `docs/RESULTS.md`, a Markdown file under
   `docs/`. D5 stays unchanged.
+
+## D8 -- Target implementation in Rust
+
+Ratified 2026-11-24.
+
+- The implementation for the target, decoder and encoder, is written in
+  Rust: no_std, with a C ABI, and with defined behavior for every
+  arithmetic operation. A port to C or another language takes it as its
+  reference.
+- The Python implementation is normative for the bitstream and the
+  decoder arithmetic until the Rust decoder reproduces it bit-exactly on
+  every test vector. From then on the Rust decoder is normative, and the
+  Python decoder stays bit-exact with it through shared test vectors.
+  Encoders are never normative.
+- The toolchain (D6) and the place of the Rust code in the layout (D5)
+  are decided before the first instruction that builds Rust code.
