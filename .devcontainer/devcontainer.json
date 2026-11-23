@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+{
+  "name": "kaplos",
+  "build": { "dockerfile": "Containerfile", "context": "." },
+  "runArgs": ["--userns=keep-id:uid=1000,gid=1000"],
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind",
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "mounts": ["source=kaplos-claude,target=/home/dev/.claude,type=volume"],
+  "containerEnv": { "CLAUDE_CONFIG_DIR": "/home/dev/.claude" },
+  "otherPortsAttributes": { "onAutoForward": "ignore" },
+  "remoteUser": "dev",
+  "updateRemoteUserUID": false,
+  "customizations": {
+    "vscode": { "extensions": ["anthropic.claude-code"] }
+  }
+}

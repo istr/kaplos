@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: BSD-2-Clause-Patent
+#
+# Dev container for the executor (D6). Every input is pinned, and every value
+# below was measured on 2026-11-23: the base image by its linux/amd64 manifest
+# digest, every Debian package by one snapshot.debian.org timestamp, libopus by
+# the commit of its release tag, and the agent binary by its checksum.
+
+FROM docker.io/library/debian@sha256:7378260c0a098d27ac206225db5e7d92b8c7c84ea7afccc86eeb513756bbd392
+
+# All packages, the base image's own included, come from one snapshot. apt
+# checks each against the signed snapshot indexes; check-valid-until=no is
+# needed because the indexes of a past snapshot have expired by design. The
+# package lists are removed afterward: the executor installs nothing.
+RUN set -eu; \
+    T=20261123T000000Z; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/$T/ trixie main" > /etc/apt/sources.list; \
+    echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/$T/ trixie-updates main" >> /etc/apt/sources.list; \
+    echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/$T/ trixie-security main" >> /etc/apt/sources.list; \
+    apt-get update -q; \
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+        python3 python3-numpy python3-numba python3-soundfile ffmpeg \
+        git gpg ca-certificates gcc make cmake libc6-dev binutils; \
+    rm -rf /var/lib/apt/lists/*
+
+# libopus with custom modes, only for the Opus Custom baseline. The tag is
+# checked against its commit, so a moved tag fails the build. Installed under
+# /usr/local: the static library and the headers in include/opus/.
+RUN set -eu; \
+    git clone -q --depth 1 --branch v1.6.1 https://github.com/xiph/opus /tmp/opus; \
+    test "$(git -C /tmp/opus rev-parse HEAD)" = 22244de5a79bd1d6d623c32e72bf1954b56235be; \
+    cmake -S /tmp/opus -B /tmp/opus/build -DOPUS_CUSTOM_MODES=ON -DCMAKE_BUILD_TYPE=Release -DOPUS_BUILD_PROGRAMS=OFF; \
+    cmake --build /tmp/opus/build -j2; \
+    cmake --install /tmp/opus/build; \
+    rm -rf /tmp/opus
+
+# The agent: the native binary of the version-pinned npm package, under a
+# checksum.
+ADD --checksum=sha256:9b7b53954b8ffb886fafeefe9ef1e0e9e5c15e8aaf2f54d65ba64d0cca795dc7 https://registry.npmjs.org/@anthropic-ai/claude-code-linux-x64/-/claude-code-linux-x64-2.1.319.tgz /tmp/claude-code.tgz
+RUN set -eu; \
+    tar -xzf /tmp/claude-code.tgz -C /tmp package/claude; \
+    install -m 0755 /tmp/package/claude /usr/local/bin/claude; \
+    rm -rf /tmp/claude-code.tgz /tmp/package
+
+# The user dev with uid and gid 1000, which the keep-id mapping in
+# devcontainer.json places the host user on. The agent's configuration
+# directory exists in the image, so the volume mounted there takes its owner.
+RUN set -eu; \
+    groupadd -g 1000 dev; \
+    useradd -m -u 1000 -g 1000 -s /bin/bash dev; \
+    install -d -o dev -g dev /home/dev/.claude
+USER dev
